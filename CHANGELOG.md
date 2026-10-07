@@ -8,6 +8,11 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `Decoder::output_video_dimensions` / `output_pixel_format`: the luma
+  size of the frame `receive_frame` last returned (before the first, the
+  next decoded one), `Yuv420P`. A source-format or custom-size change is
+  reported with the first frame that has it.
+
 - Annex M **Improved PB-frames encoder** (`encoder_pb` module,
   re-exported from `encoder`): `encode_improved_pb_picture` /
   `encode_improved_pb_picture_stats` + `ImprovedPbConfig` emit the

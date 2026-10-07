@@ -390,8 +390,11 @@ pub struct H263StreamDecoder {
     /// PTS (consumed once; further pictures from the same packet carry
     /// no PTS).
     pts_marks: VecDeque<(u64, Option<i64>)>,
-    /// Decoded frames not yet collected via `receive_frame`.
-    pending: VecDeque<Frame>,
+    /// Decoded frames not yet collected via `receive_frame`, each with
+    /// its luma size.
+    pending: VecDeque<(Frame, (u32, u32))>,
+    /// Luma size of the frame `receive_frame` last returned.
+    last_output: Option<(u32, u32)>,
     /// Prediction reference: the last decoded reference picture.
     reference: Option<YuvFrame>,
     /// §5.1.4.4 inherited-mode + §G.4 reference-TR stream state.
@@ -422,6 +425,7 @@ impl H263StreamDecoder {
             stream_pos: 0,
             pts_marks: VecDeque::new(),
             pending: VecDeque::new(),
+            last_output: None,
             reference: None,
             state: SequenceState::default(),
             eager_floor: 0,
@@ -480,8 +484,10 @@ impl H263StreamDecoder {
             if i == last {
                 self.reference = Some(f.clone());
             }
+            // §5.1.5 bounds the luma size at 2048 × 1152.
+            let size = (f.luma_width as u32, f.luma_height as u32);
             self.pending
-                .push_back(Frame::Video(yuv_to_video_frame(f, pts.take())));
+                .push_back((Frame::Video(yuv_to_video_frame(f, pts.take())), size));
         }
         Ok(())
     }
@@ -595,10 +601,24 @@ impl Decoder for H263StreamDecoder {
 
     fn receive_frame(&mut self) -> CoreResult<Frame> {
         match self.pending.pop_front() {
-            Some(f) => Ok(f),
+            Some((f, size)) => {
+                self.last_output = Some(size);
+                Ok(f)
+            }
             None if self.flushed => Err(CoreError::Eof),
             None => Err(CoreError::NeedMore),
         }
+    }
+
+    /// The frame last returned; before the first, the next decoded one.
+    fn output_video_dimensions(&self) -> Option<(u32, u32)> {
+        self.last_output
+            .or_else(|| self.pending.front().map(|(_, size)| *size))
+    }
+
+    /// Every picture is 4:2:0 at 8 bits, with even luma sizes.
+    fn output_pixel_format(&self) -> Option<PixelFormat> {
+        self.output_video_dimensions().map(|_| PixelFormat::Yuv420P)
     }
 
     fn flush(&mut self) -> CoreResult<()> {
@@ -616,6 +636,7 @@ impl Decoder for H263StreamDecoder {
         self.stream_pos = 0;
         self.pts_marks.clear();
         self.pending.clear();
+        self.last_output = None;
         self.reference = None;
         self.state = SequenceState::default();
         self.eager_floor = 0;
