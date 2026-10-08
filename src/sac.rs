@@ -724,13 +724,15 @@ pub fn decode_modb_sac(dec: &mut SacDecoder<'_, '_>) -> crate::pb_layer::ModbPre
     }
 }
 
-/// Encode an Annex G MODB symbol (Table 11 indexing).
+/// Encode an Annex G MODB symbol (Table 11 indexing). Intel's
+/// [`crate::pb_layer::ModbPresence::CbpbOnly`] has no Table 11 row and
+/// never combines with SAC; it takes the CBPB row's symbol.
 pub fn encode_modb_sac(enc: &mut SacEncoder<'_>, modb: crate::pb_layer::ModbPresence) {
     use crate::pb_layer::ModbPresence;
     let index = match modb {
         ModbPresence::None => 0,
         ModbPresence::MvdbOnly => 1,
-        ModbPresence::CbpbAndMvdb => 2,
+        ModbPresence::CbpbAndMvdb | ModbPresence::CbpbOnly => 2,
     };
     enc.encode_symbol(index, &CUMF_MODB_G);
 }

@@ -233,6 +233,31 @@ pub struct DecodeOptions {
     /// `advanced-prediction-mode` conformance fixture decodes
     /// byte-exactly only with it).
     pub obmc_skip_zero_right: bool,
+    /// **FFmpeg-compatibility deviation** for Advanced-Prediction
+    /// pictures: the §F.3 right remote vectors of a macroblock are those
+    /// FFmpeg's decoder gives its right neighbour, not the neighbour's
+    /// own vectors.
+    ///
+    /// FFmpeg (`preview_obmc`, libavcodec/ituh263dec.c) reconstructs a
+    /// macroblock before it decodes the next one, so it predicts the
+    /// next macroblock's vectors ahead of time from its coded MVDs. It
+    /// does so before storing the current macroblock's own vectors: the
+    /// left candidate of that prediction is what the current macroblock
+    /// held then — zero at the start of each picture, or the vectors the
+    /// macroblock to its left predicted for it the same way (none for a
+    /// macroblock in column 0 or right of an INTRA one). Where that
+    /// differs from the final left vector, the right remote differs from
+    /// the neighbour's vector, in FFmpeg's output and so in VLC's. With
+    /// this flag set the decoder reproduces it; off (the default) it
+    /// follows §F.3, as FFmpeg's encoder reconstructs.
+    pub obmc_ffmpeg_preview: bool,
+    /// §5.1.4.3 RTYPE of a PLUSPTYPE P-picture: the §6.1.2 `RCONTROL`
+    /// of its motion compensation (`true` rounds half-pel averages
+    /// down), as FFmpeg's `no_rounding`. A wire signal, not a caller
+    /// choice: the PLUSPTYPE driver sets it from MPPTYPE, and baseline
+    /// pictures (which have no RTYPE) leave it `false`. B-pictures
+    /// round regardless.
+    pub rounding_type: bool,
 }
 
 /// Picture-level layout the §4.2.1 GOB walker needs: total luma
@@ -1015,6 +1040,8 @@ pub fn decode_pb_picture_sac(
             annex_m: false,
             left_bpb_forward_mv: None,
             umv: UmvCoding::from_baseline(header.umv_mode),
+            discard_b: false,
+            intel_modb: false,
             b_frame: &mut b_frame,
         }),
     )?;
@@ -1110,6 +1137,7 @@ fn decode_sac_macroblock_stream(
                         quantiser_before: current_quant,
                         modified_quant: false,
                         umv_table_d3: false,
+                        pb_intel_modb: false,
                     },
                 )?;
                 if matches!(mb.mb_type, Some(MbType::Stuffing)) {
@@ -1193,6 +1221,7 @@ fn decode_sac_macroblock_stream(
                     mb_rows_total,
                     None,
                     None,
+                    None,
                 );
             }
             pending_ap = pending_new;
@@ -1208,6 +1237,7 @@ fn decode_sac_macroblock_stream(
                 &grid,
                 mb_cols,
                 mb_rows_total,
+                None,
                 None,
                 None,
             );
@@ -1281,6 +1311,7 @@ fn decode_one_macroblock_sac(
             blocks: [None, None, None, None],
             zero_right_remote: obmc_skip_zero_right,
             intra_remote_vector: pb_mode,
+            rcontrol: RCONTROL_DEFAULT,
         });
         return Ok((zero, [zero; 4], pending));
     }
@@ -1345,6 +1376,7 @@ fn decode_one_macroblock_sac(
             UmvCoding::from_baseline(umv_mode),
             /* segment */ 0,
             pb_mode,
+            /* checked */ true,
         )?;
         let chroma_vec = chroma_mv_4mv(&mvs4);
         let inter_cbpy = cbpy ^ 0b1111;
@@ -1365,6 +1397,7 @@ fn decode_one_macroblock_sac(
             blocks,
             zero_right_remote: false,
             intra_remote_vector: pb_mode,
+            rcontrol: RCONTROL_DEFAULT,
         });
 
         // Chroma: no OBMC (§F.2) — immediate reconstruction.
@@ -1418,6 +1451,7 @@ fn decode_one_macroblock_sac(
             blocks,
             zero_right_remote: false,
             intra_remote_vector: pb_mode,
+            rcontrol: RCONTROL_DEFAULT,
         });
     } else {
         let y_ref = RefPlane::new(&reference.y, reference.luma_width, reference.luma_height);
@@ -1864,6 +1898,7 @@ fn decode_rru_picture_body(
                         quantiser_before: current_quant,
                         modified_quant: false,
                         umv_table_d3: umv.table_d3(),
+                        pb_intel_modb: false,
                     },
                 )?;
                 if matches!(mb.mb_type, Some(MbType::Stuffing)) {
@@ -2251,6 +2286,7 @@ pub fn enumerate_mb_boundaries(data: &[u8]) -> Result<Vec<MbBoundaryInfo>> {
                             quantiser_before: current_quant,
                             modified_quant: false,
                             umv_table_d3: false,
+                            pb_intel_modb: false,
                         },
                     )?;
                     if matches!(mb.mb_type, Some(MbType::Stuffing)) {
@@ -2590,6 +2626,91 @@ pub fn decode_sequence_step(
         }
     }
     Ok(frames)
+}
+
+/// Decode **one Intel H.263 picture** (`h263i`, FourCC `I263`) and
+/// advance the cross-picture [`SequenceState`] — the
+/// [`decode_sequence_step`] of Intel's variant.
+///
+/// The picture header is Intel's ([`crate::intel`]); the GOB and
+/// macroblock layers are the version 1 ones the baseline driver reads,
+/// under the modes the header sets: long vectors (§D.2 wrap form),
+/// advanced prediction, PB-frames and, from Intel's format 7 extension,
+/// the loop filter (Annex J), whatever `options.deblock` says. A
+/// PB-frame (Annex G's form, or Intel's own with its extra MODB bit)
+/// decodes as FFmpeg decodes it: the B-part is parsed and dropped, and
+/// only the P-picture is returned.
+///
+/// `size_in_force` is the luma size FFmpeg's decoder context holds: the
+/// container's, until a picture of a standard source format replaces
+/// it. Pictures decode in whole macroblocks, so the frames returned are
+/// the size rounded up to a multiple of 16 (the prediction reference
+/// FFmpeg keeps too); after the call `*size_in_force` is the visible
+/// size, at their top left. A picture that fails to decode leaves it
+/// unchanged: FFmpeg keeps a size from a header that parsed, so one
+/// damaged header naming a standard format would mis-size every later
+/// custom-format picture.
+///
+/// # Errors
+///
+/// * The header errors of [`crate::intel::parse_intel_picture_header`].
+/// * [`Error::NotImplemented`] for a size in force outside
+///   `[1, 2048] × [1, 1152]`.
+/// * The errors of the baseline driver.
+pub fn decode_intel_sequence_step(
+    picture: &[u8],
+    reference: Option<&YuvFrame>,
+    options: DecodeOptions,
+    state: &mut SequenceState,
+    size_in_force: &mut (u32, u32),
+) -> Result<Vec<YuvFrame>> {
+    let mut reader = BitReader::new(picture);
+    let intel = crate::intel::parse_intel_picture_header(&mut reader, *size_in_force)?;
+    let (w, h) = intel.size;
+    let layout = PictureLayout::for_custom_dimensions(w.div_ceil(16) * 16, h.div_ceil(16) * 16)
+        .ok_or(Error::NotImplemented)?;
+    let options = DecodeOptions {
+        deblock: intel.loop_filter,
+        ..options
+    };
+    let header = intel.header;
+    let umv = UmvCoding::from_baseline(header.umv_mode);
+    let tr = header.temporal_reference;
+    // A PB-frame's B-part is dropped: the B-picture sink stays empty, and
+    // TRB / TRD go unused.
+    let mut unused_b = YuvFrame {
+        y: Vec::new(),
+        cb: Vec::new(),
+        cr: Vec::new(),
+        luma_width: 0,
+        luma_height: 0,
+    };
+    let pb = (intel.pb_frame != 0).then(|| PbPictureCtx {
+        trb: i32::from(intel.trb),
+        trd: 0,
+        dbquant: intel.dbquant,
+        annex_m: false,
+        left_bpb_forward_mv: None,
+        umv,
+        discard_b: true,
+        intel_modb: intel.pb_frame == 2,
+        b_frame: &mut unused_b,
+    });
+    let frame = decode_after_picture_header(
+        &mut reader,
+        &header,
+        &layout,
+        reference,
+        options,
+        pb,
+        Some(intel.pquant),
+        umv,
+        None,
+    )?;
+    *size_in_force = intel.size;
+    state.inherited = InheritedExtendedState::default();
+    state.prev_tr = Some(tr);
+    Ok(vec![frame])
 }
 
 /// Locate the byte offset of the next byte-aligned Picture Start Code
@@ -3463,6 +3584,13 @@ struct PbPictureCtx<'b> {
     /// (Annex G) and the Table D.3 / range reconstruction of the §M.2.2
     /// forward vector under UMV+ (Annex M).
     umv: UmvCoding,
+    /// FFmpeg's PB-frame decoding, used for Intel H.263: the B-part is
+    /// parsed and dropped (`b_frame` is never written), and INTRA
+    /// macroblocks predict as zero vectors, their B-purpose vector
+    /// unused — FFmpeg's decoder outputs the P-picture only.
+    discard_b: bool,
+    /// Intel's PB-frame MODB form ([`MbContext::pb_intel_modb`]).
+    intel_modb: bool,
     /// The B-picture under construction (same geometry as the
     /// P-picture).
     b_frame: &'b mut YuvFrame,
@@ -3588,6 +3716,8 @@ pub fn decode_pb_picture(
             annex_m: false,
             left_bpb_forward_mv: None,
             umv: UmvCoding::from_baseline(header.umv_mode),
+            discard_b: false,
+            intel_modb: false,
             b_frame: &mut b_frame,
         }),
         None,
@@ -3701,6 +3831,8 @@ pub fn decode_pb_picture_no_gob0_header(
             annex_m: false,
             left_bpb_forward_mv: None,
             umv: UmvCoding::from_baseline(header.umv_mode),
+            discard_b: false,
+            intel_modb: false,
             b_frame: &mut b_frame,
         }),
         Some(pquant),
@@ -3920,6 +4052,8 @@ pub fn decode_improved_pb_picture_with_inherited(
                     annex_m: true,
                     left_bpb_forward_mv: None,
                     umv,
+                    discard_b: false,
+                    intel_modb: false,
                     b_frame: &mut b_frame,
                 }),
                 Some(pquant),
@@ -4816,8 +4950,11 @@ fn plus_ptype_to_baseline_shim(
         aic: options.aic || advanced_intra_effective,
         modified_quant: options.modified_quant || modified_quant_effective,
         alt_inter_vlc: options.alt_inter_vlc || alt_inter_vlc_effective,
-        // Caller-only compatibility deviation — no wire signal exists.
+        // Caller-only compatibility deviations — no wire signal exists.
         obmc_skip_zero_right: options.obmc_skip_zero_right,
+        obmc_ffmpeg_preview: options.obmc_ffmpeg_preview,
+        // §5.1.4.3 — RTYPE comes off the wire only.
+        rounding_type: extended.plus.mpptype.rounding_type,
     };
 
     Ok(PlusShimOutcome {
@@ -4912,22 +5049,29 @@ impl UmvCoding {
 /// a component outside it is a malformed stream
 /// ([`Error::BadMvdCode`]).
 fn reconstruct_mv_coded(umv: UmvCoding, predictor: MotionVector, mvd: Mvd) -> Result<MotionVector> {
-    match umv {
-        UmvCoding::Off => Ok(reconstruct_mv(predictor, mvd)),
-        UmvCoding::Wrap => Ok(reconstruct_mv_umv(predictor, mvd)),
-        UmvCoding::TableD3 {
-            h_min,
-            h_max,
-            v_min,
-            v_max,
-        } => {
-            let mv = crate::motion::reconstruct_mv_umv_plus(predictor, mvd);
-            if mv.dx_half < h_min || mv.dx_half > h_max || mv.dy_half < v_min || mv.dy_half > v_max
-            {
-                return Err(Error::BadMvdCode);
-            }
-            Ok(mv)
+    let mv = reconstruct_mv_unchecked(umv, predictor, mvd);
+    if let UmvCoding::TableD3 {
+        h_min,
+        h_max,
+        v_min,
+        v_max,
+    } = umv
+    {
+        if mv.dx_half < h_min || mv.dx_half > h_max || mv.dy_half < v_min || mv.dy_half > v_max {
+            return Err(Error::BadMvdCode);
         }
+    }
+    Ok(mv)
+}
+
+/// [`reconstruct_mv_coded`] without the Table D.3 range check, for
+/// [`DecodeOptions::obmc_ffmpeg_preview`]: FFmpeg's preview keeps
+/// whatever vector its predictor gives.
+fn reconstruct_mv_unchecked(umv: UmvCoding, predictor: MotionVector, mvd: Mvd) -> MotionVector {
+    match umv {
+        UmvCoding::Off => reconstruct_mv(predictor, mvd),
+        UmvCoding::Wrap => reconstruct_mv_umv(predictor, mvd),
+        UmvCoding::TableD3 { .. } => crate::motion::reconstruct_mv_umv_plus(predictor, mvd),
     }
 }
 
@@ -4996,7 +5140,11 @@ fn decode_after_picture_header_inner(
     if header.sac_mode || header.pb_frames != pb.is_some() {
         return Err(Error::NotImplemented);
     }
-    let pb_mode = pb.is_some();
+    // FFmpeg's PB-frame decoding (Intel H.263, [`PbPictureCtx`]): the
+    // macroblock layer still carries the B fields, but prediction is
+    // that of a plain P-picture and the B-part is parsed and dropped.
+    let pb_discard = pb.as_ref().is_some_and(|p| p.discard_b);
+    let pb_mode = pb.is_some() && !pb_discard;
 
     let luma_w = layout.luma_width;
     let luma_h = layout.luma_height;
@@ -5118,6 +5266,12 @@ fn decode_after_picture_header_inner(
     // at the end of the macroblock row). At most one macroblock is
     // ever pending.
     let mut pending_ap: Option<PendingApLuma> = None;
+    // [`DecodeOptions::obmc_ffmpeg_preview`] — the vectors FFmpeg's
+    // preview wrote for each macroblock of this picture (`None` where no
+    // preview ran: its buffer starts zeroed).
+    let ffmpeg_preview = options.obmc_ffmpeg_preview && header.advanced_prediction;
+    let mut previewed: Vec<Option<Mb4Mv>> =
+        vec![None; if ffmpeg_preview { mb_cols * mb_rows_total } else { 0 }];
     // PB-frames + Advanced Prediction: the B-part of the macroblock
     // whose P-luma is still pending (reconstructed right after the
     // OBMC flush, see [`PendingPbB`]).
@@ -5206,6 +5360,7 @@ fn decode_after_picture_header_inner(
                             quantiser_before: current_quant,
                             modified_quant: options.modified_quant,
                             umv_table_d3: umv.table_d3(),
+                            pb_intel_modb: pb.as_ref().is_some_and(|p| p.intel_modb),
                         },
                     )?;
                     if matches!(mb.mb_type, Some(MbType::Stuffing)) {
@@ -5245,7 +5400,9 @@ fn decode_after_picture_header_inner(
                 // MVB), then B-residuals are added where CBPB lights
                 // them.
                 let mut pending_b_new: Option<PendingPbB> = None;
-                if let Some(pb) = pb.as_mut() {
+                if pb_discard {
+                    parse_pb_b_blocks(reader, &mb)?;
+                } else if let Some(pb) = pb.as_mut() {
                     let prev = reference.ok_or(Error::NotImplemented)?;
                     // §M.2.2 — the forward-vector predictor for
                     // Improved-PB is "the value of the forward motion
@@ -5299,7 +5456,7 @@ fn decode_after_picture_header_inner(
                 // §F.3 — the previous macroblock's OBMC right remote is
                 // resolved now that this macroblock's grid entry is
                 // recorded; flush its deferred luminance.
-                if let Some(p) = pending_ap.take() {
+                if let Some(mut p) = pending_ap.take() {
                     let r = active_reference.ok_or(Error::NotImplemented)?;
                     // Annex R: §F.3 — "if either the Slice Structured
                     // mode or the Independent Segment Decoding mode
@@ -5313,6 +5470,33 @@ fn decode_after_picture_header_inner(
                     let seg = isd_bands
                         .is_some()
                         .then(|| grid[p.row * mb_cols + p.col].segment);
+                    let right_override = if !ffmpeg_preview {
+                        None
+                    } else if grid[p.row * mb_cols + p.col].not_coded {
+                        // FFmpeg previews nothing after a not-coded
+                        // macroblock (its skip path jumps past
+                        // `preview_obmc`): the right remotes read the
+                        // zeroed buffer, and this macroblock is never
+                        // previewed.
+                        p.zero_right_remote = true;
+                        None
+                    } else {
+                        let vectors = ffmpeg_preview_vectors(
+                            &mb,
+                            &mut grid,
+                            &previewed,
+                            mb_cols,
+                            col,
+                            row,
+                            gob_top_row,
+                            gob_header_present,
+                            umv,
+                            aic_segment,
+                            pb_mode,
+                        )?;
+                        previewed[row * mb_cols + col] = vectors;
+                        vectors
+                    };
                     reconstruct_pending_ap_luma(
                         &p,
                         r,
@@ -5322,6 +5506,7 @@ fn decode_after_picture_header_inner(
                         mb_rows_total,
                         seg,
                         isd_bands.as_ref().map(|b| b[p.row]),
+                        right_override,
                     );
                 }
                 // The previous macroblock's PREC is final: its B-part
@@ -5353,6 +5538,7 @@ fn decode_after_picture_header_inner(
                     mb_rows_total,
                     seg,
                     isd_bands.as_ref().map(|b| b[p.row]),
+                    None,
                 );
             }
             if let Some(b) = pending_b.take() {
@@ -7833,6 +8019,8 @@ fn decode_slice_structured_after_header_inner(
                 annex_m: req.annex_m,
                 left_bpb_forward_mv: None,
                 umv: req.umv,
+                discard_b: false,
+                intel_modb: false,
                 b_frame: req.b_frame,
             })
         }
@@ -7972,6 +8160,7 @@ fn decode_slice_structured_after_header_inner(
                         // shared `options`).
                         modified_quant: options.modified_quant,
                         umv_table_d3: umv.table_d3(),
+                        pb_intel_modb: false,
                     },
                 )?;
                 if matches!(mb.mb_type, Some(MbType::Stuffing)) {
@@ -8070,6 +8259,7 @@ fn decode_slice_structured_after_header_inner(
                     mb_rows_total,
                     Some(segment),
                     None,
+                    None,
                 );
             }
             if let Some(b) = pending_b.take() {
@@ -8112,6 +8302,7 @@ fn decode_slice_structured_after_header_inner(
                 mb_cols,
                 mb_rows_total,
                 Some(segment),
+                None,
                 None,
             );
         }
@@ -8301,6 +8492,7 @@ fn decode_one_macroblock(
             blocks: [None, None, None, None],
             zero_right_remote: options.obmc_skip_zero_right,
             intra_remote_vector: pb_mode,
+            rcontrol: i32::from(options.rounding_type),
         });
         return Ok((zero, [zero; 4], pending));
     }
@@ -8551,6 +8743,7 @@ fn decode_one_macroblock(
             blocks,
             zero_right_remote: false,
             intra_remote_vector: pb_mode,
+            rcontrol: i32::from(options.rounding_type),
         });
     } else {
         let y_ref = ref_plane_isd(
@@ -8562,7 +8755,7 @@ fn decode_one_macroblock(
         for blk in 0..4 {
             let has_coef = (inter_cbpy >> (3 - blk)) & 1 == 1;
             let (bx, by) = luma_block_origin(mb_x, mb_y, blk);
-            let prediction = motion_compensate_block(&y_ref, bx, by, luma_mv, RCONTROL_DEFAULT);
+            let prediction = motion_compensate_block(&y_ref, bx, by, luma_mv, i32::from(options.rounding_type));
             let samples = if has_coef {
                 // §S.2 — Alternative INTER VLC for coefficients.
                 let block = if options.alt_inter_vlc {
@@ -8593,7 +8786,7 @@ fn decode_one_macroblock(
         reference.chroma_height(),
         chroma_band,
     );
-    let cb_pred = motion_compensate_block(&cb_ref, c_x, c_y, chroma_vec, RCONTROL_DEFAULT);
+    let cb_pred = motion_compensate_block(&cb_ref, c_x, c_y, chroma_vec, i32::from(options.rounding_type));
     let cb_samples = if cbpc & 0b10 != 0 {
         // §S.2 — Alternative INTER VLC applies to every INTER block,
         // including chrominance.
@@ -8621,7 +8814,7 @@ fn decode_one_macroblock(
         reference.chroma_height(),
         chroma_band,
     );
-    let cr_pred = motion_compensate_block(&cr_ref, c_x, c_y, chroma_vec, RCONTROL_DEFAULT);
+    let cr_pred = motion_compensate_block(&cr_ref, c_x, c_y, chroma_vec, i32::from(options.rounding_type));
     let cr_samples = if cbpc & 0b01 != 0 {
         // §S.2 — Alternative INTER VLC applies to every INTER block,
         // including chrominance.
@@ -8941,6 +9134,9 @@ struct PendingApLuma {
     /// every INTRA macroblock carries for its B-blocks). `false`
     /// outside PB-frames mode (INTRA remote → current vector, §F.3).
     intra_remote_vector: bool,
+    /// §6.1.2 `RCONTROL` of the picture's motion compensation
+    /// ([`DecodeOptions::rounding_type`]).
+    rcontrol: i32,
 }
 
 /// Reconstruct the luminance of a deferred Advanced-Prediction INTER
@@ -8975,6 +9171,9 @@ fn reconstruct_pending_ap_luma(
     slice_segment: Option<u32>,
     // Annex R — the segment's luma band; OBMC fetches clamp into it.
     isd_band: Option<(usize, usize)>,
+    // [`DecodeOptions::obmc_ffmpeg_preview`] — the vectors FFmpeg gives
+    // the coded INTER macroblock to the right, used as its remotes.
+    right_override: Option<Mb4Mv>,
 ) {
     let col = pending.col;
     let row = pending.row;
@@ -9006,7 +9205,15 @@ fn reconstruct_pending_ap_luma(
     let nb_right = if mb_right_outside {
         None
     } else {
-        Some(grid[row * mb_cols + (col + 1)])
+        let entry = grid[row * mb_cols + (col + 1)];
+        Some(match right_override {
+            Some(mvs4) => MbGridEntry {
+                mv: mvs4[0],
+                mvs4,
+                ..entry
+            },
+            None => entry,
+        })
     };
 
     // [`DecodeOptions::obmc_skip_zero_right`] — a skipped macroblock
@@ -9062,7 +9269,7 @@ fn reconstruct_pending_ap_luma(
             r_bot,
             s_left,
             s_right,
-            RCONTROL_DEFAULT,
+            pending.rcontrol,
         );
         let samples = match &pending.blocks[blk_i] {
             Some(block) => {
@@ -9138,6 +9345,7 @@ fn decode_inter4v_macroblock(
         umv,
         aic_segment,
         pb_mode,
+        /* checked */ true,
     )?;
 
     // Chroma vector per §F.2 / Table F.1: sum of the four luma vectors
@@ -9177,6 +9385,7 @@ fn decode_inter4v_macroblock(
             blocks,
             zero_right_remote: false,
             intra_remote_vector: pb_mode,
+            rcontrol: i32::from(options.rounding_type),
         });
     } else {
         // Deblocking-Filter-mode four vectors (Table J.1: OBMC OFF):
@@ -9187,7 +9396,7 @@ fn decode_inter4v_macroblock(
             let blk_i = blk.index();
             let (bx, by) = luma_block_origin(mb_x, mb_y, blk_i);
             let q_mv = mvs4[blk_i];
-            let prediction = motion_compensate_block(&y_ref, bx, by, q_mv, RCONTROL_DEFAULT);
+            let prediction = motion_compensate_block(&y_ref, bx, by, q_mv, i32::from(options.rounding_type));
             let has_coef = (inter_cbpy >> (3 - blk_i)) & 1 == 1;
             let samples = if has_coef {
                 let block = parse_block(
@@ -9216,7 +9425,7 @@ fn decode_inter4v_macroblock(
         reference.chroma_width(),
         reference.chroma_height(),
     );
-    let cb_pred = motion_compensate_block(&cb_ref, c_x, c_y, chroma_vec, RCONTROL_DEFAULT);
+    let cb_pred = motion_compensate_block(&cb_ref, c_x, c_y, chroma_vec, i32::from(options.rounding_type));
     let cb_samples = if cbpc & 0b10 != 0 {
         let block = parse_block(
             reader,
@@ -9237,7 +9446,7 @@ fn decode_inter4v_macroblock(
         reference.chroma_width(),
         reference.chroma_height(),
     );
-    let cr_pred = motion_compensate_block(&cr_ref, c_x, c_y, chroma_vec, RCONTROL_DEFAULT);
+    let cr_pred = motion_compensate_block(&cr_ref, c_x, c_y, chroma_vec, i32::from(options.rounding_type));
     let cr_samples = if cbpc & 0b01 != 0 {
         let block = parse_block(
             reader,
@@ -9294,6 +9503,9 @@ fn reconstruct_inter4v_mvs(
     umv: UmvCoding,
     current_segment: u32,
     pb_frames: bool,
+    // `false` for [`DecodeOptions::obmc_ffmpeg_preview`]: no Table D.3
+    // range check, as FFmpeg's preview makes none.
+    checked: bool,
 ) -> Result<Mb4Mv> {
     // §5.3.7 / §5.3.8 — the parser already pulled the four MVDs for an
     // INTER4V macroblock in AP mode. Block order is Figure 5
@@ -9373,13 +9585,79 @@ fn reconstruct_inter4v_mvs(
 
         let predictor = predict_mv_median(mv1, mv2, mv3);
         let mvd = mvds[blk.index()];
-        let mv = reconstruct_mv_coded(umv, predictor, mvd)?;
+        let mv = if checked {
+            reconstruct_mv_coded(umv, predictor, mvd)?
+        } else {
+            reconstruct_mv_unchecked(umv, predictor, mvd)
+        };
         mvs4[blk.index()] = mv;
         // §F.2 — later blocks of this macroblock use the reconstructed
         // vector as an intra-macroblock candidate predictor.
         neighbourhood.current[blk.index()] = mv;
     }
     Ok(mvs4)
+}
+
+/// [`DecodeOptions::obmc_ffmpeg_preview`] — the vectors FFmpeg's
+/// `preview_obmc` gives the macroblock `mb` at `(col, row)` while the
+/// one to its left (the pending Advanced-Prediction macroblock) is
+/// reconstructed: zero for a not-coded macroblock, none for an INTRA one
+/// (FFmpeg then substitutes the current vector, as §F.3 does), otherwise
+/// its coded MVDs over the usual predictor, with the left macroblock's
+/// vectors as FFmpeg held them at that point (`previewed`, zero where no
+/// preview ran) and no range check. The row above is final by then.
+#[allow(clippy::too_many_arguments)]
+fn ffmpeg_preview_vectors(
+    mb: &H263Macroblock,
+    grid: &mut [MbGridEntry],
+    previewed: &[Option<Mb4Mv>],
+    mb_cols: usize,
+    col: usize,
+    row: usize,
+    gob_top_row: usize,
+    gob_header_present: bool,
+    umv: UmvCoding,
+    segment: u32,
+    pb_mode: bool,
+) -> Result<Option<Mb4Mv>> {
+    let zero = MotionVector::new(0, 0);
+    if !mb.coded {
+        return Ok(Some([zero; 4]));
+    }
+    let mb_type = mb.mb_type.ok_or(Error::NotImplemented)?;
+    if mb_type.is_intra() {
+        return Ok(None);
+    }
+    // The left macroblock's vectors as they stood: a not-coded one
+    // holds zero either way.
+    let left = row * mb_cols + col - 1;
+    let saved = grid[left];
+    let stale = previewed[left].unwrap_or([zero; 4]);
+    grid[left].mvs4 = stale;
+    grid[left].mv = stale[LumaBlockIndex::B2.index()];
+    let vectors = if matches!(mb_type, MbType::Inter4V | MbType::Inter4VQ) {
+        reconstruct_inter4v_mvs(
+            mb,
+            grid,
+            mb_cols,
+            col,
+            row,
+            gob_top_row,
+            gob_header_present,
+            umv,
+            segment,
+            pb_mode,
+            /* checked */ false,
+        )
+    } else {
+        let predictor =
+            predict_mv_ap_single(grid, mb_cols, col, row, gob_top_row, gob_header_present, segment, pb_mode);
+        mb.mvd
+            .ok_or(Error::NotImplemented)
+            .map(|mvd| [reconstruct_mv_unchecked(umv, predictor, mvd); 4])
+    };
+    grid[left] = saved;
+    vectors.map(Some)
 }
 
 /// §F.2 candidate-predictor derivation for a **single-MV** macroblock
@@ -9699,7 +9977,10 @@ fn luma_block_origin(mb_x: usize, mb_y: usize, blk: usize) -> (usize, usize) {
 /// The per-edge condition runs the filter when at least one of the two
 /// macroblocks touching the edge is coded (COD == 0 or INTRA) per
 /// §J.3. The STRENGTH is taken from Table J.2 against the QUANT of the
-/// macroblock owning `block2` (the lower / right block of the edge).
+/// macroblock owning `block2` (the lower / right block of the edge)
+/// when that macroblock is coded, else of the one owning `block1`, as
+/// FFmpeg's `ff_h263_loop_filter` chooses (a not-coded macroblock
+/// records the QUANT in force, which is not the coded neighbour's).
 fn apply_deblocking(
     frame: &mut YuvFrame,
     grid: &[MbGridEntry],
@@ -9746,11 +10027,8 @@ fn apply_deblocking(
                 !e.not_coded
             };
             if coded(mb1) || coded(mb2) {
-                let q = mb_quant
-                    .get(mb2.1 * mb_cols + mb2.0)
-                    .copied()
-                    .filter(|&q| q != 0)
-                    .unwrap_or_else(|| mb_quant[mb1.1 * mb_cols + mb1.0]);
+                let owner = if coded(mb2) { mb2 } else { mb1 };
+                let q = mb_quant[owner.1 * mb_cols + owner.0];
                 EdgeCondition::Filter {
                     strength: strength_for_quant(q),
                 }
@@ -10211,6 +10489,8 @@ mod tests {
                 modified_quant: false,
                 alt_inter_vlc: false,
                 obmc_skip_zero_right: false,
+                obmc_ffmpeg_preview: false,
+                rounding_type: false,
             },
         )
         .expect("decode");
@@ -12196,6 +12476,8 @@ mod tests {
                 modified_quant: false,
                 alt_inter_vlc: false,
                 obmc_skip_zero_right: false,
+                obmc_ffmpeg_preview: false,
+                rounding_type: false,
             },
         )
         .expect("AIC driver should decode the zero-residual picture");
@@ -12295,6 +12577,8 @@ mod tests {
                 modified_quant: false,
                 alt_inter_vlc: false,
                 obmc_skip_zero_right: false,
+                obmc_ffmpeg_preview: false,
+                rounding_type: false,
             },
         )
         .expect("AIC driver should decode the +1-DC picture");
@@ -12368,6 +12652,8 @@ mod tests {
                 modified_quant: false,
                 alt_inter_vlc: false,
                 obmc_skip_zero_right: false,
+                obmc_ffmpeg_preview: false,
+                rounding_type: false,
             },
         )
         .expect("decode");

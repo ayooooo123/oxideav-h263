@@ -430,6 +430,7 @@ mod tests {
                 quantiser_before: 8,
                 modified_quant: false,
                 umv_table_d3: false,
+                pb_intel_modb: false,
             },
         )
         .unwrap();
@@ -473,6 +474,7 @@ mod tests {
                 quantiser_before: 5,
                 modified_quant: false,
                 umv_table_d3: false,
+                pb_intel_modb: false,
             },
         )
         .unwrap();
@@ -513,6 +515,7 @@ mod tests {
                 quantiser_before: 10,
                 modified_quant: false,
                 umv_table_d3: false,
+                pb_intel_modb: false,
             },
         )
         .unwrap();
@@ -569,6 +572,7 @@ mod tests {
                 quantiser_before: 7,
                 modified_quant: false,
                 umv_table_d3: false,
+                pb_intel_modb: false,
             },
         )
         .unwrap();
@@ -596,6 +600,7 @@ mod tests {
                 quantiser_before: 8,
                 modified_quant: false,
                 umv_table_d3: false,
+                pb_intel_modb: false,
             },
         )
         .unwrap();

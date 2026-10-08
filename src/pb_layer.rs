@@ -193,13 +193,18 @@ pub enum ModbPresence {
     /// Table 11 row 2 — both CBPB and MVDB on the wire. Code `11`,
     /// 2 bits.
     CbpbAndMvdb,
+    /// Intel H.263's PB-frame variant only
+    /// ([`crate::intel::parse_intel_modb`]): CBPB on the wire, MVDB
+    /// absent. Code `111`, 3 bits; Table 11 has no such row.
+    CbpbOnly,
 }
 
 impl ModbPresence {
-    /// `true` iff Table 11 marks CBPB as present ("X" in the CBPB
-    /// column). Only [`ModbPresence::CbpbAndMvdb`] does.
+    /// `true` iff CBPB is present: Table 11 marks it ("X" in the CBPB
+    /// column) only for [`ModbPresence::CbpbAndMvdb`]; Intel's
+    /// [`ModbPresence::CbpbOnly`] carries it too.
     pub fn has_cbpb(self) -> bool {
-        matches!(self, ModbPresence::CbpbAndMvdb)
+        matches!(self, ModbPresence::CbpbAndMvdb | ModbPresence::CbpbOnly)
     }
 
     /// `true` iff Table 11 marks MVDB as present ("X" in the MVDB
@@ -210,12 +215,14 @@ impl ModbPresence {
     }
 
     /// Length in bits of the §5.3.3 / Table 11 codeword that produced
-    /// this tag. Useful for tests and for any caller that needs the
-    /// post-parse bit cursor without re-running the bitreader.
+    /// this tag (Intel's CBPB-only codeword: 3). Useful for tests and for
+    /// any caller that needs the post-parse bit cursor without re-running
+    /// the bitreader.
     pub fn code_bits(self) -> u32 {
         match self {
             ModbPresence::None => 1,
             ModbPresence::MvdbOnly | ModbPresence::CbpbAndMvdb => 2,
+            ModbPresence::CbpbOnly => 3,
         }
     }
 }

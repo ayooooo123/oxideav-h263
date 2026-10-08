@@ -1363,6 +1363,7 @@ mod tests {
                 quantiser_before: gob.quantiser,
                 modified_quant: false,
                 umv_table_d3: false,
+                pb_intel_modb: false,
             },
         )
         .expect("mb");

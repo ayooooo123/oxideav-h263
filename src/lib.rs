@@ -31,8 +31,8 @@
 //!   callers that need it.
 //! * **Round 5** — Coefficient reconstruction §6.1 / §6.2.1
 //!   inverse-quant (H.261-style modulo-2-oddifier), §6.2.2 clip,
-//!   §6.2.3 zigzag scatter, §6.2.4 separable 8×8 IDCT (direct
-//!   orthonormal kernel in `f64`, meeting Annex A.7), and §6.3.2
+//!   §6.2.3 zigzag scatter, §6.2.4 8×8 IDCT (FFmpeg's integer simple
+//!   IDCT, meeting Annex A, see [`idct`]), and §6.3.2
 //!   intra-block sample clip to `[0, 255]`. Composed end-to-end
 //!   into [`reconstruct_intra_block`] which takes a parsed
 //!   [`H263Block`] + QUANT and emits an 8×8 `u8` sample block.
@@ -232,8 +232,10 @@ pub mod encoder_pb;
 pub mod encoder_rc;
 pub mod encoder_vlc;
 pub mod fdct;
+mod ffmpeg_idct;
 pub mod gob_header;
 pub mod idct;
+pub mod intel;
 pub mod intra_tcoef;
 pub mod macroblock;
 pub mod motion;
@@ -769,8 +771,8 @@ pub fn parse_picture_header_from_bytes(data: &[u8]) -> Result<H263PictureHeader>
 ///    for INTRA),
 /// 2. §6.2.2 clip of AC reconstruction levels to `[-2048, 2047]`,
 /// 3. §6.2.3 / Figure 14 zigzag → 8×8 scatter,
-/// 4. §6.2.4 inverse DCT in `f64` (Annex A.7-conformant by
-///    construction),
+/// 4. §6.2.4 inverse DCT (FFmpeg's integer simple IDCT, Annex
+///    A-conformant),
 /// 5. §6.3.2 clip to the 8-bit picture range `[0, 255]`.
 ///
 /// `quant` is the QUANT from §5.2.6 / §5.3.6 (range `1..=31`); the
@@ -795,8 +797,8 @@ pub fn reconstruct_intra_block(block: &H263Block, quant: u8) -> [u8; COEFFS_PER_
 ///    DC bypass — slot 0 is processed under the standard formula),
 /// 2. §6.2.2 clip of reconstruction levels to `[-2048, 2047]`,
 /// 3. §6.2.3 / Figure 14 zigzag → 8×8 scatter,
-/// 4. §6.2.4 inverse DCT in `f64` (Annex A.7-conformant by
-///    construction),
+/// 4. §6.2.4 inverse DCT (FFmpeg's integer simple IDCT, Annex
+///    A-conformant),
 /// 5. §6.3.1 summation of the IDCT residual with the
 ///    motion-compensated prediction,
 /// 6. §6.3.2 clip to the 8-bit picture range `[0, 255]`.

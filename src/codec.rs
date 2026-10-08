@@ -28,7 +28,13 @@
 //!   in [`crate::picture::decode_sequence`]; an Annex G / Annex M
 //!   PB-frame yields two output frames in display order;
 //! * `reset()` drops the buffer, the reference and the cross-picture
-//!   state so decode resumes cleanly after a seek.
+//!   state so decode resumes cleanly after a seek;
+//! * Intel H.263 (`h263i`, FourCC `I263`) decodes through
+//!   [`decode_intel_sequence_step`]: the 8-byte dummy packets Intel's
+//!   encoder writes decode to nothing, as in FFmpeg, and a custom-format
+//!   picture takes its size from the container (`params.width` /
+//!   `height`), reported through `output_video_dimensions` over planes
+//!   decoded in whole macroblocks.
 //!
 //! ## Encoder
 //!
@@ -61,13 +67,41 @@ use crate::encoder_rc::{
     encode_inter_picture_adaptive, encode_intra_picture_adaptive, AdaptiveQuantConfig,
 };
 use crate::picture::{
-    decode_picture_no_gob0_header, decode_sequence_step, next_picture_start_code, DecodeOptions,
-    SequenceState, YuvFrame,
+    decode_intel_sequence_step, decode_picture_no_gob0_header, decode_sequence_step,
+    next_picture_start_code, DecodeOptions, SequenceState, YuvFrame,
 };
 use crate::rate_control::RateController;
 
 /// The registry identifier this crate's codec registers under.
 pub const CODEC_ID: &str = "h263";
+
+/// The registry identifier of Intel H.263 (FFmpeg's `h263i`), which the
+/// same decoder reads through [`decode_intel_sequence_step`].
+pub const INTEL_CODEC_ID: &str = "h263i";
+
+/// The luma sizes an Intel H.263 decoder tracks.
+#[derive(Debug, Clone, Copy)]
+struct IntelSize {
+    /// The size a custom-format picture decodes at.
+    in_force: (u32, u32),
+    /// The container's (`params.width` / `height`).
+    container: (u32, u32),
+}
+
+/// One picture through the H.263 driver, or the Intel one when `intel`
+/// holds an Intel size (updated by the picture).
+fn decode_step(
+    picture: &[u8],
+    reference: Option<&YuvFrame>,
+    options: DecodeOptions,
+    state: &mut SequenceState,
+    intel: &mut Option<IntelSize>,
+) -> crate::Result<Vec<YuvFrame>> {
+    match intel {
+        Some(size) => decode_intel_sequence_step(picture, reference, options, state, &mut size.in_force),
+        None => decode_sequence_step(picture, reference, options, state),
+    }
+}
 
 /// Map a crate-level decode/encode error onto the framework error
 /// vocabulary: [`crate::Error::NotImplemented`] means "legal stream,
@@ -89,7 +123,10 @@ fn core_error(e: crate::Error) -> CoreError {
 /// deblocking filter are exposed as opt-ins, mirroring
 /// [`DecodeOptions`]; PLUSPTYPE streams signal all four in OPPTYPE and
 /// need no options. `obmc_skip_zero_right` is the documented
-/// ecosystem-compatibility deviation for Advanced-Prediction streams.
+/// ecosystem-compatibility deviation for Advanced-Prediction streams;
+/// FFmpeg's own deviation there ([`DecodeOptions::obmc_ffmpeg_preview`])
+/// is on unless `obmc_spec_right_remote` is set, so pictures equal
+/// FFmpeg's (and so VLC's).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct H263DecoderOptions {
     /// Annex J §J.3 in-loop deblocking filter (baseline streams only —
@@ -106,6 +143,10 @@ pub struct H263DecoderOptions {
     /// ecosystem-compatibility deviation some encoder families
     /// require — see [`DecodeOptions::obmc_skip_zero_right`]).
     pub obmc_skip_zero_right: bool,
+    /// §F.3 right remote vectors as the spec defines them, instead of
+    /// those FFmpeg's decoder uses (the default, see
+    /// [`DecodeOptions::obmc_ffmpeg_preview`]).
+    pub obmc_spec_right_remote: bool,
 }
 
 impl H263DecoderOptions {
@@ -116,6 +157,9 @@ impl H263DecoderOptions {
             modified_quant: self.modified_quant,
             alt_inter_vlc: self.alt_inter_vlc,
             obmc_skip_zero_right: self.obmc_skip_zero_right,
+            obmc_ffmpeg_preview: !self.obmc_spec_right_remote,
+            // A wire signal the PLUSPTYPE driver sets per picture.
+            rounding_type: false,
         }
     }
 }
@@ -152,6 +196,12 @@ impl CodecOptionsStruct for H263DecoderOptions {
             default: OptionValue::Bool(false),
             help: "zero right-half OBMC remotes for skipped macroblocks (ecosystem deviation)",
         },
+        OptionField {
+            name: "obmc_spec_right_remote",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "§F.3 OBMC right remotes instead of FFmpeg's (FFmpeg compatibility is the default)",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &OptionValue) -> CoreResult<()> {
@@ -161,6 +211,7 @@ impl CodecOptionsStruct for H263DecoderOptions {
             "modified_quant" => self.modified_quant = value.as_bool()?,
             "alt_inter_vlc" => self.alt_inter_vlc = value.as_bool()?,
             "obmc_skip_zero_right" => self.obmc_skip_zero_right = value.as_bool()?,
+            "obmc_spec_right_remote" => self.obmc_spec_right_remote = value.as_bool()?,
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())
@@ -374,6 +425,10 @@ fn video_frame_to_yuv(v: &VideoFrame, width: usize, height: usize) -> CoreResult
 pub struct H263StreamDecoder {
     id: CodecId,
     options: DecodeOptions,
+    /// Intel H.263 only: the luma size in force (the container's, until
+    /// a picture of a standard source format replaces it), and the
+    /// container's, which `reset()` restores.
+    intel: Option<IntelSize>,
     /// [`oxideav_core::DecoderLimits::max_pixels_per_frame`] cap the
     /// construction parameters carried; checked against every decoded
     /// picture's geometry (H.263 geometry is architecturally bounded
@@ -417,9 +472,14 @@ impl H263StreamDecoder {
     /// not enforced.
     pub fn from_params(params: &CodecParameters) -> CoreResult<Self> {
         let opts: H263DecoderOptions = oxideav_core::parse_options(&params.options)?;
+        let intel = (params.codec_id.as_str() == INTEL_CODEC_ID).then(|| {
+            let size = (params.width.unwrap_or(0), params.height.unwrap_or(0));
+            IntelSize { in_force: size, container: size }
+        });
         Ok(H263StreamDecoder {
-            id: CodecId::new(CODEC_ID),
+            id: CodecId::new(if intel.is_some() { INTEL_CODEC_ID } else { CODEC_ID }),
             options: opts.to_decode_options(),
+            intel,
             max_pixels: params.limits.max_pixels_per_frame,
             buf: Vec::new(),
             stream_pos: 0,
@@ -454,19 +514,19 @@ impl H263StreamDecoder {
     }
 
     /// Decode one complete picture slice, push its frames, advance the
-    /// reference / limits bookkeeping.
+    /// reference / limits bookkeeping. The slice is consumed whether or
+    /// not it decodes: a damaged picture is dropped with its error, and
+    /// the next one decodes against the last good reference (kept at the
+    /// head of the buffer, it would fail every later call).
     fn decode_picture_slice(&mut self, end: usize) -> CoreResult<()> {
         let pts = self.take_pts(self.stream_pos);
         let picture = &self.buf[..end];
-        let frames = decode_sequence_step(picture, self.reference.as_ref(), self.options, {
-            // Split borrow: state is disjoint from buf/reference.
-            &mut self.state
-        })
-        .map_err(core_error)?;
-        self.commit_frames(frames, pts)?;
+        let mut intel = self.intel;
+        let decoded = decode_step(picture, self.reference.as_ref(), self.options, &mut self.state, &mut intel);
+        self.intel = intel;
         self.discard(end);
         self.eager_floor = 0;
-        Ok(())
+        self.commit_frames(decoded.map_err(core_error)?, pts)
     }
 
     /// Push decoded frames (display order) into the output queue; the
@@ -484,8 +544,13 @@ impl H263StreamDecoder {
             if i == last {
                 self.reference = Some(f.clone());
             }
-            // §5.1.5 bounds the luma size at 2048 × 1152.
-            let size = (f.luma_width as u32, f.luma_height as u32);
+            // §5.1.5 bounds the luma size at 2048 × 1152. An Intel
+            // custom-format picture shows the size in force, at the top
+            // left of planes decoded in whole macroblocks.
+            let size = match self.intel {
+                Some(intel) => intel.in_force,
+                None => (f.luma_width as u32, f.luma_height as u32),
+            };
             self.pending
                 .push_back((Frame::Video(yuv_to_video_frame(f, pts.take())), size));
         }
@@ -544,14 +609,17 @@ impl H263StreamDecoder {
                     }
                     let pts_at = self.stream_pos;
                     let mut speculative = self.state;
-                    match decode_sequence_step(
+                    let mut intel = self.intel;
+                    match decode_step(
                         &self.buf,
                         self.reference.as_ref(),
                         self.options,
                         &mut speculative,
+                        &mut intel,
                     ) {
                         Ok(frames) => {
                             self.state = speculative;
+                            self.intel = intel;
                             let pts = self.take_pts(pts_at);
                             self.commit_frames(frames, pts)?;
                             // Retain a possible split PSC prefix of the
@@ -590,6 +658,11 @@ impl Decoder for H263StreamDecoder {
             return Err(CoreError::invalid(
                 "oxideav-h263: send_packet after flush (reset the decoder first)",
             ));
+        }
+        // Intel H.263: a packet of exactly 64 bits is a dummy frame
+        // (`ff_intel_h263_decode_picture_header`'s FRAME_SKIPPED).
+        if self.intel.is_some() && packet.data.len() == crate::intel::DUMMY_FRAME_BYTES {
+            return Ok(());
         }
         if !packet.data.is_empty() {
             self.pts_marks
@@ -639,6 +712,9 @@ impl Decoder for H263StreamDecoder {
         self.last_output = None;
         self.reference = None;
         self.state = SequenceState::default();
+        if let Some(intel) = self.intel.as_mut() {
+            intel.in_force = intel.container;
+        }
         self.eager_floor = 0;
         self.flushed = false;
         Ok(())
@@ -880,25 +956,19 @@ pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
 
 /// Build this codec's [`CodecInfo`] registration record: capabilities,
 /// both factories, the option schemas, the container tags (`H263` —
-/// AVI-family FourCC — and `S263`, the 3GP/MP4 sample-entry code), and
-/// the byte-aligned §5.1.1 Picture-Start-Code payload magics
-/// (`00 00 8x`, the four values of the TR high bits) for raw
-/// elementary-stream identification.
+/// AVI-family FourCC — `S263`, the 3GP/MP4 sample-entry code, and
+/// `U263`, the AVI FourCC FFmpeg writes H.263+ under), and the
+/// byte-aligned §5.1.1 Picture-Start-Code payload magics (`00 00 8x`,
+/// the four values of the TR high bits) for raw elementary-stream
+/// identification.
 fn codec_info() -> CodecInfo {
-    let mut caps = CodecCapabilities::video("h263_sw");
-    caps.lossy = true;
-    caps.lossless = false;
-    caps.intra_only = false;
-    // §5.1.5 CPFMT bounds the coded geometry at 2048 × 1152.
-    caps.max_width = Some(2048);
-    caps.max_height = Some(1152);
     CodecInfo::new(CodecId::new(CODEC_ID))
-        .capabilities(caps)
+        .capabilities(capabilities())
         .decoder(make_decoder)
         .encoder(make_encoder)
         .decoder_options::<H263DecoderOptions>()
         .encoder_options::<H263EncoderOptions>()
-        .tags([CodecTag::fourcc(b"H263"), CodecTag::fourcc(b"S263")])
+        .tags([CodecTag::fourcc(b"H263"), CodecTag::fourcc(b"S263"), CodecTag::fourcc(b"U263")])
         .payload_magics([
             vec![0x00, 0x00, 0x80],
             vec![0x00, 0x00, 0x81],
@@ -907,8 +977,33 @@ fn codec_info() -> CodecInfo {
         ])
 }
 
-/// Install this crate's codec — decoder + encoder factories, tag and
-/// payload-magic claims — into the runtime context's codec registry.
+/// The registration record of Intel H.263: the decoder only, under the
+/// AVI FourCC `I263`.
+fn intel_codec_info() -> CodecInfo {
+    let mut caps = capabilities();
+    caps.implementation = "h263i_sw".into();
+    CodecInfo::new(CodecId::new(INTEL_CODEC_ID))
+        .capabilities(caps)
+        .decoder(make_decoder)
+        .decoder_options::<H263DecoderOptions>()
+        .tags([CodecTag::fourcc(b"I263")])
+}
+
+fn capabilities() -> CodecCapabilities {
+    let mut caps = CodecCapabilities::video("h263_sw");
+    caps.lossy = true;
+    caps.lossless = false;
+    caps.intra_only = false;
+    // §5.1.5 CPFMT bounds the coded geometry at 2048 × 1152.
+    caps.max_width = Some(2048);
+    caps.max_height = Some(1152);
+    caps
+}
+
+/// Install this crate's codecs — H.263 (decoder + encoder factories,
+/// tag and payload-magic claims) and Intel H.263 (decoder, tag) — into
+/// the runtime context's codec registry.
 pub fn register(ctx: &mut RuntimeContext) {
     ctx.codecs.register(codec_info());
+    ctx.codecs.register(intel_codec_info());
 }

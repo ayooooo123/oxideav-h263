@@ -149,6 +149,13 @@ pub struct MbContext {
     /// of the Table 11 [`ModbPresence`] accessors. When `false` the
     /// Annex G Table 11 form is used.
     pub pb_annex_m: bool,
+    /// Intel H.263's PB-frame variant (`pb_frame` 2 of its picture
+    /// header, see [`crate::intel`]): MODB is the Table 11 form with one
+    /// more bit after `11` that drops MVDB
+    /// ([`crate::intel::parse_intel_modb`]). Ignored unless
+    /// [`MbContext::pb_frames`] is set and [`MbContext::pb_annex_m`]
+    /// is not.
+    pub pb_intel_modb: bool,
     /// Current QUANT from the most recent GOB-layer header (or
     /// the picture-layer's PQUANT in the no-GOB case). Used to
     /// compute [`H263Macroblock::quantiser_after`] after any
@@ -417,11 +424,14 @@ pub fn parse_macroblock(reader: &mut BitReader<'_>, ctx: MbContext) -> Result<H2
     // because it requires PLUSPTYPE, which §G.1 bars — Table 10
     // nonetheless lists MODB for it, so no type gate is needed).
     // Annex M (Improved PB-frames) replaces Table 11 with the §M.4
-    // Table M.1 6-entry form; otherwise the Annex G Table 11 form is
-    // read. Only one of the two MODB fields is ever populated.
+    // Table M.1 6-entry form, Intel's PB-frame variant one more bit;
+    // otherwise the Annex G Table 11 form is read. Only one of the two
+    // MODB fields is ever populated.
     let (modb, annex_m_modb) = if ctx.pb_frames {
         if ctx.pb_annex_m {
             (None, Some(parse_modb_annex_m(reader)?))
+        } else if ctx.pb_intel_modb {
+            (Some(crate::intel::parse_intel_modb(reader)?), None)
         } else {
             (Some(parse_modb(reader)?), None)
         }
@@ -1012,6 +1022,7 @@ mod tests {
             quantiser_before: q,
             modified_quant: false,
             umv_table_d3: false,
+            pb_intel_modb: false,
         }
     }
 
@@ -1026,6 +1037,7 @@ mod tests {
             quantiser_before: q,
             modified_quant: false,
             umv_table_d3: false,
+            pb_intel_modb: false,
         }
     }
 
@@ -1845,6 +1857,7 @@ mod tests {
                 quantiser_before: gob.quantiser,
                 modified_quant: false,
                 umv_table_d3: false,
+                pb_intel_modb: false,
             },
         )
         .expect("mb");
@@ -1866,6 +1879,7 @@ mod tests {
             quantiser_before: q,
             modified_quant: false,
             umv_table_d3: false,
+            pb_intel_modb: false,
         }
     }
 
@@ -1882,6 +1896,7 @@ mod tests {
             quantiser_before: q,
             modified_quant: false,
             umv_table_d3: false,
+            pb_intel_modb: false,
         }
     }
 

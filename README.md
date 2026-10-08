@@ -277,8 +277,10 @@ planar 4:2:0 `YuvFrame`:
   zigzag scan order.
 * **INTRA reconstruction (§6.1 / §6.2 / §6.3.2)** — H.261-style
   inverse quantisation (modulo-2 oddifier), `[-2048, +2047]` AC clip,
-  zigzag → 8×8 scatter (Figure 14), inverse DCT (f64 kernel meeting
-  the Annex A.7 accuracy budget), sample clip to `[0, 255]`.
+  zigzag → 8×8 scatter (Figure 14), inverse DCT (FFmpeg's integer
+  "simple IDCT", its C path, LGPL-2.1-or-later in `src/ffmpeg_idct.rs`;
+  it meets the Annex A.7 accuracy budget, and pictures equal FFmpeg's
+  with `-idct simple`), sample clip to `[0, 255]`.
 * **INTER reconstruction (§6.1.1 / §6.1.2 / §6.3.1)** — differential
   motion-vector reconstruction with the Figure-12 median predictor and
   candidate border-decision rules, Table 18 chroma vector derivation,
@@ -329,6 +331,17 @@ planar 4:2:0 `YuvFrame`:
   opt-in ecosystem-compatibility deviation (zero right-half remotes
   for skipped macroblocks) the fixture's producing encoder family
   requires — the spec-default differs only there.
+  `DecodeOptions::obmc_ffmpeg_preview` reproduces FFmpeg's right
+  remotes instead (it predicts the right neighbour's vectors before
+  storing the current macroblock's, and previews nothing after a
+  skipped one); the registry decoder enables it by default, so its
+  pictures equal FFmpeg's (`obmc_spec_right_remote` restores §F.3).
+* **Intel H.263** (`h263i`, FourCC `I263`) — Intel's picture header,
+  ported from FFmpeg's `intelh263dec.c` (LGPL-2.1-or-later,
+  `src/intel.rs`): its format 7 extension (loop filter, PB-frames with
+  an extra MODB bit), the custom format sized by the container, and
+  the 8-byte dummy frames. PB-frames decode as FFmpeg decodes them:
+  the B-part is parsed and dropped.
 * **Annex I §I.2 / §I.3** — Advanced INTRA Coding: the INTRA_MODE VLC
   (Table I.1), the two alternate DCT scans (Figure I.2) and scan
   selection, the separate INTRA-coefficient VLC (Table I.2), the

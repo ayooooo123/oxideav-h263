@@ -8,6 +8,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Intel H.263** (`h263i`, AVI FourCC `I263`): Intel's picture header
+  (`intel` module, ported from FFmpeg's `intelh263dec.c`,
+  LGPL-2.1-or-later), decoded by `decode_intel_sequence_step` and by the
+  registry decoder under the `h263i` id: the format-7 extension (loop
+  filter, PB-frames), the custom format whose size is the container's,
+  and the 8-byte dummy packets, which decode to nothing. PB-frames,
+  Annex G's form and Intel's own (one more MODB bit,
+  `ModbPresence::CbpbOnly`), decode as FFmpeg decodes them: the B-part
+  is parsed and dropped, and only the P-picture is output.
+- The `U263` FourCC (H.263+ in AVI, as FFmpeg writes it) resolves to the
+  `h263` decoder.
+- `DecodeOptions::obmc_ffmpeg_preview`: Advanced-Prediction right remote
+  vectors as FFmpeg's decoder computes them (`preview_obmc`), on by
+  default in the registry decoder (`obmc_spec_right_remote` restores
+  §F.3).
+
 - `Decoder::output_video_dimensions` / `output_pixel_format`: the luma
   size of the frame `receive_frame` last returned (before the first, the
   next decoded one), `Yuv420P`. A source-format or custom-size change is
@@ -124,8 +140,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   applies (§M.2.2 → §5.3.7 / §D.2) and rejects a Table 14 one outright;
   the Annex G + UMV MVDB (Table 14, §D.2 pair rule) agrees exactly.
 
+### Changed
+
+- The inverse DCT is FFmpeg's integer simple IDCT (C path,
+  `src/ffmpeg_idct.rs`, LGPL-2.1-or-later) instead of the `f64` kernel:
+  decoded pictures now equal FFmpeg's (`-idct simple`) sample for sample.
+
 ### Fixed
 
+- Annex J deblocking: an edge between a coded and a not-coded
+  macroblock takes the coded one's QUANT, as documented (and as FFmpeg
+  does); the not-coded macroblock's QUANT in force was used.
+- PLUSPTYPE P-pictures use their §5.1.4.3 RTYPE as the
+  motion-compensation `RCONTROL` (`DecodeOptions::rounding_type`); it was
+  applied only under Annex Q, so H.263+ pictures with rounding type 1
+  were predicted with the wrong half-pel rounding.
+- The registry decoder drops a complete picture that fails to decode
+  instead of keeping it at the head of its buffer, where it failed every
+  later `send_packet` until `reset()`.
 - The Improved PB-frame decode driver consumed neither the §5.1.24
   PEI / PSUPP loop nor the §5.2.2 group-number-0 GOB-header elision:
   a spec-conformant Improved PB-frame (as any real encoder emits it,

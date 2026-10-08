@@ -1,48 +1,31 @@
 //! H.263 inverse discrete cosine transform (§6.2.4) and intra-block
 //! sample reconstruction (§6.3.2 clip).
 //!
-//! ITU-T Recommendation H.263 (01/2005) §6.2.4 defines the inverse
-//! transform via the literal mathematical equation
-//!
-//! ```text
-//!                 1   7   7                                u           v
-//!     f(x, y) = ─── · Σ   Σ  C(u) C(v) F(u, v) cos π(2x+1)── cos π(2y+1)──
-//!                 4  u=0 v=0                              16          16
-//!
-//!     C(0) = 1/√2,   C(k) = 1  for k ≠ 0
-//! ```
-//!
-//! (The spec writes "C(u) = 1/2 for u = 0", which together with the
-//! 1/4 prefactor gives an orthonormal kernel — i.e. with C(0) = 1/√2
-//! and the 1/4 scaled to 2/8 the overall constant matches `1 / (2√2 · 2√2) = 1/8`
-//! for the DC-DC weighting, which is what the orthonormal definition
-//! in §A.2 fixes.) The spec defers "the arithmetic procedures for
-//! computing the inverse transform" to the implementer, only
-//! requiring that the result meet the Annex A.7 accuracy budget. We
-//! pick the simplest direct double-precision evaluation — a tight
-//! loop over 64 (x, y) output pixels each summing 64 (u, v)
-//! frequency-domain terms — which is the textbook orthonormal IDCT
-//! definition with no separability tricks. Annex A.7 demands at most
-//! 1 LSB peak error against an "at least 64-bit floating point"
-//! reference; using exactly 64-bit floats with `f64::cos` for the
-//! cosine table puts us at that reference, so Annex A.7 is satisfied
-//! by construction.
+//! §6.2.4 defines the inverse transform by its mathematical equation
+//! and leaves "the arithmetic procedures for computing the inverse
+//! transform" to the implementer, within the Annex A accuracy budget.
+//! Decoders therefore differ by ±1 on some samples, and the difference
+//! compounds along a P-picture chain. This crate computes FFmpeg's
+//! integer "simple IDCT" ([`crate::ffmpeg_idct`], its C path), which
+//! meets Annex A, so its pictures equal FFmpeg's (`-idct simple`) sample
+//! for sample.
 //!
 //! ## Output range and clipping
 //!
 //! §6.2.4 says "The output from the inverse transform ranges from
 //! –256 to +255 after clipping to be represented with 9 bits." We
-//! apply this clip on the rounded integer output of the IDCT before
-//! returning.
+//! apply this clip on the IDCT's integer output before returning. It
+//! never changes a reconstructed sample: the §6.3.2 clip to `[0, 255]`
+//! follows, after adding a prediction in `[0, 255]` for INTER blocks.
 //!
 //! ## Intra-block sample reconstruction
 //!
 //! §6.3.1: for INTRA blocks "the reconstruction is equal to the
 //! result of the inverse transformation". §6.3.2 then clips to
 //! `[0, 255]` for display. We expose [`reconstruct_intra_samples`]
-//! that walks the cosine kernel against an 8×8 dequantised
-//! coefficient block (post-zigzag scatter) and emits an 8×8 `u8`
-//! sample block ready for the picture buffer.
+//! that runs the IDCT on an 8×8 dequantised coefficient block
+//! (post-zigzag scatter) and emits an 8×8 `u8` sample block ready for
+//! the picture buffer.
 
 use crate::block::COEFFS_PER_BLOCK;
 
@@ -54,76 +37,23 @@ pub const IDCT_OUT_MAX: i16 = 255;
 /// Side length of the H.263 transform block.
 pub const BLOCK_DIM: usize = 8;
 
-/// 8×8 cosine basis cache.
-///
-/// `cos_table()[k][n]` returns `cos(π · (2n+1) · k / 16)` for `k, n`
-/// in `0..8`. The kernel is even-symmetric under `(2n+1) → (15 - (2n+1))`
-/// and odd-symmetric for odd `k`, but we don't lean on that — the
-/// table is small (64 doubles) and the IDCT is called once per block.
-fn cos_table() -> &'static [[f64; BLOCK_DIM]; BLOCK_DIM] {
-    use std::sync::OnceLock;
-    static TABLE: OnceLock<[[f64; BLOCK_DIM]; BLOCK_DIM]> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut t = [[0.0f64; BLOCK_DIM]; BLOCK_DIM];
-        for (k, row) in t.iter_mut().enumerate() {
-            for (n, slot) in row.iter_mut().enumerate() {
-                let arg = core::f64::consts::PI * ((2 * n + 1) as f64) * (k as f64) / 16.0;
-                *slot = arg.cos();
-            }
-        }
-        t
-    })
-}
-
-/// `C(k)` from §6.2.4 — `1/√2` for k = 0, `1` otherwise.
-#[inline]
-fn c(k: usize) -> f64 {
-    if k == 0 {
-        1.0 / core::f64::consts::SQRT_2
-    } else {
-        1.0
-    }
-}
-
 /// §6.2.4 inverse DCT.
 ///
 /// Takes an 8×8 dequantised coefficient block in row-major order
 /// (`coefs[row * 8 + col] == F(u=col, v=row)`) and returns the 8×8
-/// inverse-transformed sample block, also row-major. Output is
-/// rounded to integer and clipped to `[-256, +255]` per §6.2.4.
+/// inverse-transformed sample block, also row-major, clipped to
+/// `[-256, +255]` per §6.2.4.
 ///
 /// **Convention.** This crate uses the convention `(u, v) = (col, row)`
 /// throughout — i.e. block position `(row, col)` in storage carries
-/// the frequency-domain coefficient `F(col, row)`. The inverse
-/// transform is symmetric in `(u, v)` swap, so the convention is
-/// internally consistent regardless of which axis is named first.
+/// the frequency-domain coefficient `F(col, row)`, FFmpeg's layout:
+/// the integer transform rounds its row and column passes differently,
+/// so the orientation matters.
 pub fn idct_8x8(coefs: &[i16; COEFFS_PER_BLOCK]) -> [i16; COEFFS_PER_BLOCK] {
-    let table = cos_table();
+    let pixels = crate::ffmpeg_idct::simple_idct(coefs);
     let mut out = [0i16; COEFFS_PER_BLOCK];
-    for y in 0..BLOCK_DIM {
-        for x in 0..BLOCK_DIM {
-            let mut acc = 0.0f64;
-            for v in 0..BLOCK_DIM {
-                for u in 0..BLOCK_DIM {
-                    let f = coefs[v * BLOCK_DIM + u] as f64;
-                    acc += c(u) * c(v) * f * table[u][x] * table[v][y];
-                }
-            }
-            // §6.2.4 prefactor 1/4: outer `1/4` ⋅ inner `C(0) = 1/√2`
-            // factors land us at the orthonormal scaling. We apply the
-            // 1/4 here.
-            let pixel = acc * 0.25;
-            // Round-half-away-from-zero (the standard `floor(x + 0.5)`
-            // for positive, `ceil(x - 0.5)` for negative). The spec
-            // calls for "the nearest integer".
-            let rounded = if pixel >= 0.0 {
-                (pixel + 0.5).floor() as i32
-            } else {
-                (pixel - 0.5).ceil() as i32
-            };
-            let clipped = rounded.clamp(IDCT_OUT_MIN as i32, IDCT_OUT_MAX as i32) as i16;
-            out[y * BLOCK_DIM + x] = clipped;
-        }
+    for (slot, &v) in out.iter_mut().zip(&pixels) {
+        *slot = v.clamp(IDCT_OUT_MIN as i32, IDCT_OUT_MAX as i32) as i16;
     }
     out
 }

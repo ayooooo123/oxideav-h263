@@ -4,9 +4,10 @@
 //!
 //! The transform itself is non-normative on the encode side: the spec
 //! (§6.2.4 / Annex A) only constrains the *inverse* transform's
-//! accuracy. We use the exact orthonormal forward DCT that inverts the
-//! decoder's `f64` IDCT, so an unquantised forward → inverse round-trip
-//! reproduces the input block to within the IDCT's own rounding.
+//! accuracy. We use the exact orthonormal forward DCT, whose inverse
+//! the decoder's integer IDCT approximates within Annex A, so an
+//! unquantised forward → inverse round-trip reproduces the input block
+//! to within that IDCT's rounding.
 //!
 //! ## Forward DCT (§6.2.4 inverse)
 //!
