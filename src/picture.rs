@@ -2666,7 +2666,12 @@ pub fn decode_intel_sequence_step(
 ) -> Result<Vec<YuvFrame>> {
     let mut reader = BitReader::new(picture);
     let intel = crate::intel::parse_intel_picture_header(&mut reader, *size_in_force)?;
+    // The size in force comes from the container: bound it before
+    // rounding to whole macroblocks (`u32::MAX` would overflow there).
     let (w, h) = intel.size;
+    if !(1..=2048).contains(&w) || !(1..=1152).contains(&h) {
+        return Err(Error::NotImplemented);
+    }
     let layout = PictureLayout::for_custom_dimensions(w.div_ceil(16) * 16, h.div_ceil(16) * 16)
         .ok_or(Error::NotImplemented)?;
     let options = DecodeOptions {

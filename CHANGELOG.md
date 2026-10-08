@@ -148,6 +148,9 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Intel H.263: a container size outside 1..=2048 × 1..=1152 is refused
+  before it is rounded to whole macroblocks, where `u32::MAX` overflowed
+  (a panic with overflow checks on).
 - Annex J deblocking: an edge between a coded and a not-coded
   macroblock takes the coded one's QUANT, as documented (and as FFmpeg
   does); the not-coded macroblock's QUANT in force was used.
