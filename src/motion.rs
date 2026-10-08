@@ -551,6 +551,11 @@ fn sample_half_pel(plane: &RefPlane<'_>, hx: i32, hy: i32, rcontrol: i32) -> i32
 /// `((block_x + px) * 2 + mv.dx_half, (block_y + py) * 2 + mv.dy_half)`.
 /// The sample is fetched via §6.1.2 bilinear interpolation with edge
 /// replication.
+///
+/// Every pixel of the block has the same half-pel phase, and its integer
+/// position is the block's plus `(px, py)`. When every sample the block
+/// reads lies inside the plane (or the band), no edge replication applies
+/// and the rows are read directly, one loop per phase.
 pub fn motion_compensate_block(
     plane: &RefPlane<'_>,
     block_x: usize,
@@ -559,6 +564,48 @@ pub fn motion_compensate_block(
     rcontrol: i32,
 ) -> [u8; COEFFS_PER_BLOCK] {
     let mut out = [0u8; COEFFS_PER_BLOCK];
+    let hx0 = (block_x as i32) * 2 + mv.dx_half;
+    let hy0 = (block_y as i32) * 2 + mv.dy_half;
+    let (fx, fy) = ((hx0 & 1) as usize, (hy0 & 1) as usize);
+    let (ix0, iy0) = (hx0 >> 1, hy0 >> 1);
+    let (top, bottom) = plane.band_rows.unwrap_or((0, plane.height));
+    let inside = ix0 >= 0
+        && iy0 >= top as i32
+        && ix0 as i64 + (BLOCK_DIM + fx) as i64 <= plane.width as i64
+        && iy0 as i64 + (BLOCK_DIM + fy) as i64 <= bottom as i64;
+    if inside {
+        let w = plane.width;
+        let row = |y: usize| {
+            let start = (iy0 as usize + y) * w + ix0 as usize;
+            &plane.samples[start..start + BLOCK_DIM + fx]
+        };
+        for py in 0..BLOCK_DIM {
+            let dst = &mut out[py * BLOCK_DIM..(py + 1) * BLOCK_DIM];
+            let r0 = row(py);
+            match (fx, fy) {
+                (0, 0) => dst.copy_from_slice(r0),
+                (1, 0) => {
+                    for (px, d) in dst.iter_mut().enumerate() {
+                        *d = ((i32::from(r0[px]) + i32::from(r0[px + 1]) + 1 - rcontrol) / 2) as u8;
+                    }
+                }
+                (0, 1) => {
+                    let r1 = row(py + 1);
+                    for (px, d) in dst.iter_mut().enumerate() {
+                        *d = ((i32::from(r0[px]) + i32::from(r1[px]) + 1 - rcontrol) / 2) as u8;
+                    }
+                }
+                _ => {
+                    let r1 = row(py + 1);
+                    for (px, d) in dst.iter_mut().enumerate() {
+                        let sum = i32::from(r0[px]) + i32::from(r0[px + 1]) + i32::from(r1[px]) + i32::from(r1[px + 1]);
+                        *d = ((sum + 2 - rcontrol) / 4) as u8;
+                    }
+                }
+            }
+        }
+        return out;
+    }
     for py in 0..BLOCK_DIM {
         for px in 0..BLOCK_DIM {
             let hx = ((block_x + px) as i32) * 2 + mv.dx_half;
@@ -2265,5 +2312,42 @@ mod tests {
             min < max,
             "min={min} max={max} (flat prediction is wrong here)"
         );
+    }
+
+    /// The block MC reads rows directly when the block's samples lie inside
+    /// the plane or band, and per sample with edge replication otherwise;
+    /// both give the same prediction for every phase and RCONTROL, for
+    /// blocks whose source window crosses each edge or stays inside.
+    #[test]
+    fn block_mc_matches_per_sample_path_at_edges() {
+        let (w, h) = (24usize, 20usize);
+        let buf: Vec<u8> = (0..w * h).map(|i| (i * 37 % 251) as u8).collect();
+        for plane in [RefPlane::new(&buf, w, h), RefPlane::banded(&buf, w, h, 4, 15)] {
+            for by in [0usize, 8, 12] {
+                for bx in [0usize, 8, 16] {
+                    for dy in -20..=20 {
+                        for dx in -20..=20 {
+                            for rcontrol in [0, 1] {
+                                let mv = MotionVector { dx_half: dx, dy_half: dy };
+                                let mut want = [0u8; COEFFS_PER_BLOCK];
+                                for py in 0..BLOCK_DIM {
+                                    for px in 0..BLOCK_DIM {
+                                        let hx = ((bx + px) as i32) * 2 + dx;
+                                        let hy = ((by + py) as i32) * 2 + dy;
+                                        want[py * BLOCK_DIM + px] = sample_half_pel(&plane, hx, hy, rcontrol) as u8;
+                                    }
+                                }
+                                assert_eq!(
+                                    motion_compensate_block(&plane, bx, by, mv, rcontrol),
+                                    want,
+                                    "block ({bx}, {by}), mv ({dx}, {dy}), rcontrol {rcontrol}, band {:?}",
+                                    plane.band_rows
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

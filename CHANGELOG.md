@@ -145,6 +145,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 - The inverse DCT is FFmpeg's integer simple IDCT (C path,
   `src/ffmpeg_idct.rs`, LGPL-2.1-or-later) instead of the `f64` kernel:
   decoded pictures now equal FFmpeg's (`-idct simple`) sample for sample.
+- TCOEF decoding looks each prefix up in an index of Table 16 built once,
+  instead of scanning the table's 103 rows for every bit read, and
+  `motion_compensate_block` reads the reference rows directly, one loop
+  per half-pel phase, when the block's samples lie inside the picture (or
+  the Annex R band); blocks that reach past an edge keep the per-sample
+  path with edge replication. Output is unchanged.
 
 ### Fixed
 

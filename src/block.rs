@@ -406,36 +406,65 @@ enum TcoefEntry {
     Escape,
 }
 
+/// Longest TCOEF prefix [`decode_tcoef_event`] reads, in bits.
+const TCOEF_MAX_PREFIX_BITS: u8 = 13;
+
 /// Lookup a TCOEF VLC prefix in Table 16. Returns `Some(entry)` if
 /// the `(bits, code)` pair matches a row's prefix (i.e. the spec's
 /// printed bit-count minus the trailing sign bit for non-ESCAPE
 /// rows; the ESCAPE row has no trailing sign and its `bits` field
 /// matches directly).
+///
+/// The decoder asks once per bit read, up to 13 times per coefficient,
+/// so the rows are indexed by `(bits, code)` once, in
+/// [`TCOEF_PREFIX_INDEX`], instead of scanned on every call.
 fn lookup_tcoef_prefix(bits: u8, code: u32) -> Option<TcoefEntry> {
-    for &row in TCOEF_TABLE.iter() {
-        // For non-ESCAPE rows the table stores the spec's printed
-        // "Bits" column which includes the trailing sign bit; we
-        // compare against `bits - 1` to match the prefix only and
-        // leave the sign to `finalise_tcoef`.
-        let prefix_bits = if row.is_escape {
-            row.bits
-        } else {
-            row.bits - 1
-        };
-        if prefix_bits == bits && row.code as u32 == code {
-            return Some(if row.is_escape {
-                TcoefEntry::Escape
-            } else {
-                TcoefEntry::Vlc {
-                    last: row.last,
-                    run: row.run,
-                    abs_level: row.abs_level,
-                }
-            });
+    if bits == 0 || bits > TCOEF_MAX_PREFIX_BITS || code >> bits != 0 {
+        return None;
+    }
+    let packed = TCOEF_PREFIX_INDEX[(1usize << bits) - 2 + code as usize];
+    if packed & TCOEF_FOUND == 0 {
+        None
+    } else if packed & TCOEF_ESCAPE != 0 {
+        Some(TcoefEntry::Escape)
+    } else {
+        Some(TcoefEntry::Vlc {
+            last: packed & TCOEF_LAST != 0,
+            run: ((packed >> 6) & 0x3f) as u8,
+            abs_level: (packed & 0x3f) as u8,
+        })
+    }
+}
+
+const TCOEF_FOUND: u16 = 1 << 15;
+const TCOEF_ESCAPE: u16 = 1 << 14;
+const TCOEF_LAST: u16 = 1 << 13;
+
+/// Table 16 by prefix: for a prefix of `bits` bits whose value is `code`,
+/// slot `2^bits - 2 + code` holds the first row with that prefix (as the
+/// scan it replaces returned the first match), packed as `TCOEF_FOUND`,
+/// `TCOEF_ESCAPE`, `TCOEF_LAST`, RUN in bits 6..12 and |LEVEL| in bits
+/// 0..6, or 0 when no row has that prefix.
+static TCOEF_PREFIX_INDEX: std::sync::LazyLock<Box<[u16]>> = std::sync::LazyLock::new(|| {
+    let mut index = vec![0u16; (1usize << (TCOEF_MAX_PREFIX_BITS + 1)) - 2];
+    for row in TCOEF_TABLE {
+        let bits = if row.is_escape { row.bits } else { row.bits - 1 };
+        let code = u32::from(row.code);
+        if bits == 0 || bits > TCOEF_MAX_PREFIX_BITS || code >> bits != 0 {
+            continue;
+        }
+        debug_assert!(row.run < 64 && row.abs_level < 64, "Table 16 RUN/LEVEL fit in 6 bits");
+        let slot = &mut index[(1usize << bits) - 2 + code as usize];
+        if *slot == 0 {
+            *slot = TCOEF_FOUND
+                | if row.is_escape { TCOEF_ESCAPE } else { 0 }
+                | if row.last { TCOEF_LAST } else { 0 }
+                | (u16::from(row.run) << 6)
+                | u16::from(row.abs_level);
         }
     }
-    None
-}
+    index.into_boxed_slice()
+});
 
 /// Apply the trailing sign bit (or the ESCAPE-mode fixed-length
 /// fields) to produce a fully-decoded [`TcoefEvent`].
@@ -1475,5 +1504,28 @@ mod tests {
             parse_block(&mut r, inter_ctx_with_coefs()).unwrap_err(),
             Error::BadTcoefRunOverflow
         );
+    }
+
+    /// The prefix index answers as a scan of Table 16 does: the first row
+    /// whose prefix (the bits without the sign, or the ESCAPE row's bits)
+    /// matches, and nothing for any other prefix.
+    #[test]
+    fn tcoef_prefix_index_matches_table_scan() {
+        for bits in 0..=TCOEF_MAX_PREFIX_BITS + 1 {
+            for code in 0..(1u32 << bits) {
+                let want = TCOEF_TABLE
+                    .iter()
+                    .find(|row| {
+                        let prefix = if row.is_escape { row.bits } else { row.bits - 1 };
+                        prefix == bits && u32::from(row.code) == code
+                    })
+                    .map(|row| if row.is_escape { (true, false, 0, 0) } else { (false, row.last, row.run, row.abs_level) });
+                let got = lookup_tcoef_prefix(bits, code).map(|entry| match entry {
+                    TcoefEntry::Escape => (true, false, 0, 0),
+                    TcoefEntry::Vlc { last, run, abs_level } => (false, last, run, abs_level),
+                });
+                assert_eq!(got, want, "{bits} bits, code {code:#b}");
+            }
+        }
     }
 }
